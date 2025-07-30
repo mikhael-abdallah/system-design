@@ -1,0 +1,64 @@
+services:
+  # TIER 1: NGINX (Edge Load Balancer)
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80" # Expose the NGINX port 80 to 8080 on your machine
+    depends_on:
+      - controller_api
+    networks:
+      - my_app_net
+
+  # TIER 2: Controller API (4 nodes)
+  controller_api:
+    build: ./controller_api
+    # We will scale to 4 replicas with the 'up' command
+    networks:
+      - my_app_net
+    depends_on:
+      - haproxy
+
+  # TIER 3: HAProxy (Internal Load Balancer) - 1 node
+  haproxy:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - my_app_net
+    depends_on:
+      - repository_api
+
+  # TIER 4: Repository API (4 nodes)
+  repository_api:
+    build: ./repository_api
+    environment:
+      # Pass the database URL to the API containers
+      - DATABASE_URL=postgres://user:password@db:5432/mydb?sslmode=disable
+    networks:
+      - my_app_net
+    depends_on:
+      - db
+
+  # TIER 5: PostgreSQL Database
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=mydb
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - my_app_net
+
+# Network for the containers to communicate using their names
+networks:
+  my_app_net:
+    driver: bridge
+
+# Volume to persist the database data
+volumes:
+  postgres_data:
