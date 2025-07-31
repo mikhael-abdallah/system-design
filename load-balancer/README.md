@@ -6,6 +6,8 @@ The goal is to illustrate how requests can be distributed across different layer
 
 ## Architecture
 
+![Project Architecture](./diagram.svg)
+
 The request flow follows this path:
 
 1. The user sends a request to the system's entry point.
