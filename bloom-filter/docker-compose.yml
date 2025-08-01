@@ -1,0 +1,23 @@
+services:
+  app:
+    build: ./app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=mydb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Configura o PostgreSQL para usar mais memória
+    command: postgres -c shared_buffers=8GB
+
+volumes:
+  postgres_data:
