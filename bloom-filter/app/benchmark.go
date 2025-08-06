@@ -1,4 +1,3 @@
-// app/benchmark.go
 package main
 
 import (
@@ -8,10 +7,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	cuckoo "github.com/seiflotfy/cuckoofilter"
 )
 
-// runBenchmarks orchestrates the different performance tests.
-func runBenchmarks(db *sql.DB, bf *BloomFilter) {
+// runBenchmarks orchestrates the different performance tests for both filters.
+func runBenchmarks(db *sql.DB, bf *BloomFilter, cf *cuckoo.Filter) {
 	log.Println("\n--- Preparing data for benchmarks ---")
 
 	// Prepare a slice of 100,000 existing IDs
@@ -40,86 +40,126 @@ func runBenchmarks(db *sql.DB, bf *BloomFilter) {
 	log.Printf("Generated %d non-existent IDs for testing.", len(nonExistentIDs))
 
 	// Run the benchmarks
-	benchmarkNonExistentUsers(db, bf, nonExistentIDs)
-	benchmarkExistingUsers(db, bf, existingIDs)
+	benchmarkNonExistentUsers(db, bf, cf, nonExistentIDs)
+	benchmarkExistingUsers(db, bf, cf, existingIDs)
+	benchmarkDeletions(cf, existingIDs) // Deletion is only possible with Cuckoo Filter
 }
 
-// benchmarkNonExistentUsers compares lookup times for items that are not in the set.
-func benchmarkNonExistentUsers(db *sql.DB, bf *BloomFilter, idsToTest [][]byte) {
+// --- Benchmark for Non-Existent Items ---
+func benchmarkNonExistentUsers(db *sql.DB, bf *BloomFilter, cf *cuckoo.Filter, idsToTest [][]byte) {
 	fmt.Println("\n-------------------------------------------------------------")
 	log.Printf("--- Benchmark: Non-Existent Users (%d lookups) ---", len(idsToTest))
 	fmt.Println("-------------------------------------------------------------")
 
-	// --- Test 1: Using the Bloom Filter ---
-	falsePositives := 0
-	start := time.Now()
+	// Test 1: Bloom Filter
+	bfFalsePositives := 0
+	startBf := time.Now()
 	for _, id := range idsToTest {
 		if bf.Test(id) {
-			// This is a potential false positive. In a real app, we would now query the DB.
-			// For this benchmark, we just count it to measure the filter's accuracy.
-			falsePositives++
+			bfFalsePositives++
 		}
 	}
-	durationWithFilter := time.Since(start)
-	
-	fmt.Println("[With Bloom Filter]")
-	printMetrics(durationWithFilter, len(idsToTest))
-	fpRate := (float64(falsePositives) / float64(len(idsToTest))) * 100
-	fmt.Printf("  False Positives:  %d (%.4f%%)\n", falsePositives, fpRate)
+	durationBf := time.Since(startBf)
+	fmt.Println("[Bloom Filter]")
+	printMetrics(durationBf, len(idsToTest))
+	fpRateBf := (float64(bfFalsePositives) / float64(len(idsToTest))) * 100
+	fmt.Printf("  False Positives:  %d (%.4f%%)\n", bfFalsePositives, fpRateBf)
+
+	// Test 2: Cuckoo Filter
+	cfFalsePositives := 0
+	startCf := time.Now()
+	for _, id := range idsToTest {
+		if cf.Lookup(id) {
+			cfFalsePositives++
+		}
+	}
+	durationCf := time.Since(startCf)
+	fmt.Println("\n[Cuckoo Filter]")
+	printMetrics(durationCf, len(idsToTest))
+	fpRateCf := (float64(cfFalsePositives) / float64(len(idsToTest))) * 100
+	fmt.Printf("  False Positives:  %d (%.4f%%)\n", cfFalsePositives, fpRateCf)
 
 
-	// --- Test 2: Querying the Database Directly ---
-	start = time.Now()
+	// Test 3: Database Only
+	startDb := time.Now()
 	for _, idBytes := range idsToTest {
 		var id uuid.UUID
 		copy(id[:], idBytes)
-		// We expect this to always return sql.ErrNoRows
 		db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&id)
 	}
-	durationWithDB := time.Since(start)
-
+	durationDb := time.Since(startDb)
 	fmt.Println("\n[Database Only]")
-	printMetrics(durationWithDB, len(idsToTest))
+	printMetrics(durationDb, len(idsToTest))
 
-	fmt.Printf("\nConclusion: Bloom Filter was %.2fx faster for non-existent items.\n", float64(durationWithDB)/float64(durationWithFilter))
+	fmt.Printf("\nConclusion: Cuckoo was %.2fx faster than Bloom. Bloom was %.2fx faster than DB.\n", float64(durationBf)/float64(durationCf), float64(durationDb)/float64(durationBf))
 }
 
-// benchmarkExistingUsers compares lookup times for items that are in the set.
-func benchmarkExistingUsers(db *sql.DB, bf *BloomFilter, idsToTest [][]byte) {
+// --- Benchmark for Existing Items ---
+func benchmarkExistingUsers(db *sql.DB, bf *BloomFilter, cf *cuckoo.Filter, idsToTest [][]byte) {
 	fmt.Println("\n-------------------------------------------------------------")
 	log.Printf("--- Benchmark: Existing Users (%d lookups) ---", len(idsToTest))
 	fmt.Println("-------------------------------------------------------------")
 	
-	// --- Test 1: Using Bloom Filter + Database Query ---
-	start := time.Now()
+	// Test 1: Bloom Filter + DB
+	startBf := time.Now()
 	for _, idBytes := range idsToTest {
-		// Step 1: Check the filter (this is the overhead)
 		if bf.Test(idBytes) {
-			// Step 2: Query the DB (this will always happen for existing items)
-			var id uuid.UUID
-			copy(id[:], idBytes)
-			db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&id)
+			var id uuid.UUID; copy(id[:], idBytes); db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&id)
 		}
 	}
-	durationWithFilter := time.Since(start)
-	
+	durationBf := time.Since(startBf)
 	fmt.Println("[Bloom Filter + Database]")
-	printMetrics(durationWithFilter, len(idsToTest))
+	printMetrics(durationBf, len(idsToTest))
 
-	// --- Test 2: Querying the Database Directly ---
-	start = time.Now()
+	// Test 2: Cuckoo Filter + DB
+	startCf := time.Now()
 	for _, idBytes := range idsToTest {
-		var id uuid.UUID
-		copy(id[:], idBytes)
-		db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&id)
+		if cf.Lookup(idBytes) {
+			var id uuid.UUID; copy(id[:], idBytes); db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&id)
+		}
 	}
-	durationWithDB := time.Since(start)
+	durationCf := time.Since(startCf)
+	fmt.Println("\n[Cuckoo Filter + Database]")
+	printMetrics(durationCf, len(idsToTest))
 
+	// Test 3: Database Only
+	startDb := time.Now()
+	for _, idBytes := range idsToTest {
+		var id uuid.UUID; copy(id[:], idBytes); db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&id)
+	}
+	durationDb := time.Since(startDb)
 	fmt.Println("\n[Database Only]")
-	printMetrics(durationWithDB, len(idsToTest))
+	printMetrics(durationDb, len(idsToTest))
+	
+	overheadBf := durationBf - durationDb
+	overheadCf := durationCf - durationDb
+	fmt.Printf("\nConclusion: Bloom Filter added %v overhead. Cuckoo Filter added %v overhead.\n", overheadBf/time.Duration(len(idsToTest)), overheadCf/time.Duration(len(idsToTest)))
+}
 
-	overhead := durationWithFilter - durationWithDB
-	fmt.Printf("\nConclusion: The Bloom Filter added an average overhead of %v per lookup for existing items.\n", overhead/time.Duration(len(idsToTest)))
+// --- Benchmark for Deletions (Cuckoo Only) ---
+func benchmarkDeletions(cf *cuckoo.Filter, idsToTest [][]byte) {
+	fmt.Println("\n-------------------------------------------------------------")
+	log.Printf("--- Benchmark: Deletions (%d items) ---", len(idsToTest))
+	fmt.Println("-------------------------------------------------------------")
+
+	// Test 1: Deletion performance
+	start := time.Now()
+	for _, id := range idsToTest {
+		cf.Delete(id)
+	}
+	duration := time.Since(start)
+	fmt.Println("[Cuckoo Filter Deletion]")
+	printMetrics(duration, len(idsToTest))
+
+	// Test 2: Verification
+	foundCount := 0
+	for _, id := range idsToTest {
+		if cf.Lookup(id) {
+			foundCount++
+		}
+	}
+	fmt.Printf("\nVerification: After deleting %d items, %d were still found in the filter.\n", len(idsToTest), foundCount)
+	fmt.Println("Note: A standard Bloom Filter does not support deletion.")
 }
 
 // printMetrics is a helper function to display performance results.
